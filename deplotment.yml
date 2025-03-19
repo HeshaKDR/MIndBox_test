@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  labels:
+    app: web-app
+spec:
+  replicas: 4  # Согласно условию с пиковой нагрузкой справляется 4 пода, при этом надо учитывать все возможные сбои в работе кластера поэтому следует в дальнейшем добавить возможность увеличить их количество на 1 одну ноду. 
+  strategy:
+    type: RollingUpdate # в работе с обновлениями следует учитывать такие факторы как доступность приложения во время его обновления, возможность откатиться к предыдущей весии, плавное развертывание. 
+    rollingUpdate:
+      maxUnavailable: 1  # обновление под по одной обеспеивает посотоянную работу приложения
+      maxSurge: 1  # В случае если в кластере происходит непредвиденная ситуация у нас будет дополнительная нода, обеспечивающая его эффективную работу. 
+  selector:
+    matchLabels:
+      app: web-app 
+  template:
+    metadata:
+      labels:
+        app: web-app #далее присваеваем созданным в этом развертыванииподам соответсвующий лейбл
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - web-app
+              topologyKey: "kubernetes.io/hostname"  # Распределяем поды по разным нодам для повышения отказоустойчивости за счет того что на каждой ноде работает 1 пода. Это также способствует распределению ресурсов в кластере. 
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 1
+              preference:
+                matchExpressions:
+                  - key: "failure-domain.beta.kubernetes.io/zone"
+                    operator: In
+                    values:
+                      - zone1
+                      - zone2
+                      - zone3  # Предпочитаем распределение подов по разным зонам как сказано в задании. За счет данного правила также повышается отказоусточиваость системы. В случае если одна из зон выйдет из строя - прилождение будет работать на двух других. Также за счт данного правила обеспечивается эффективное распределение нагрузки на кластер. 
+      containers:
+        - name: web-app
+          image: your-web-app-image:latest
+          resources:
+            requests:
+              memory: "128Mi"  # Минимальное количество памяти, которое гарантированно будет выделено
+              cpu: "0.1"  # Минимальное количество CPU, которое гарантированно будет выделено
+            limits:
+              memory: "128Mi"  # Ограничиваем память, чтобы не превышать потребление
+              cpu: "0.5"  # Ограничиваем CPU, чтобы не превышать потребление во время инициализации и первых запросов к сервису
+          readinessProbe: # проверяем готов ли под принимать трафик через GET запрос 
+            httpGet:
+              path: /healthz #определяем куда напрввлен запрос в приложении
+              port: 8080  # поределяем порт прилодения который будет принмать наш HTTP GET запрос с проверкой его готовности принимать трафик. 
+            initialDelaySeconds: 10  # Даем время на инициализацию приложения
+            periodSeconds: 5 # определяем частоту проверки 
+          livenessProbe: # провеярем активно ли приложение
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                # проверяем работает ли приложение 
+                if ! /usr/bin/my-application-jobs --alive; then
+                  exit 1
+                fi
+
+                # проверяем временные показатели с тем что бы выявить дедлок 
+                if [ -f /tmp/jobs.update ]; then
+                  current_time=$(date +%s%3N)  # время в милисекундах
+                  last_update=$(cat /tmp/jobs.update)  # смотрим последний апдейт файла 
+                  timeout=60000  # определяем таймаут (e.g., 60 seconds)
+
+                  # если выходим за пределы таймаута - определяем дедлок
+                  if [ $((current_time - last_update)) -gt $timeout ]; then
+                    exit 1
+                  fi
+                else
+                  # проверка на существование файла
+                  exit 1
+                fi
+
+                # если все ок - заканчиваем скрипт с кодом 0
+                exit 0
+            initialDelaySeconds: 15  # Даем больше времени на инициализацию перед проверкой приложени приложения на активацию
+            periodSeconds: 10
+      terminationGracePeriodSeconds: 30  # Даем время на корректное завершение работы приложения
+---
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler # обеспечиваем автоматическую настройку количества модулей при развертывании  сервиса в зависимости от загрузки процессора. ТАким образом гарантируем, что приложение сможет обрабатывать повышенный трафик (при увеличении масштаба), и автоматиченски сократит  использование ресурсов при низком трафике (при уменьшении масштаба).
+metadata:
+  name: web-app-hpa
+  labels:
+    app: web-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: web-app
+  minReplicas: 2  # Минимальное количество подов для поддержания отказоустойчивости ночью - для обеспечения устойчивости к ошибкам
+  maxReplicas: 4  # Максимальное количество подов для обработки пиковой нагрузки днем
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 50  # Автомасштабирование на основе использования CPU при этом с соблюдением баланса нагрузки для обеспечения оптимальной работы кластера 
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app-service
+  labels:
+    app: web-app
+spec:
+  type: LoadBalancer  # Используем LoadBalancer для доступа к приложению извне
+  ports:
+    - port: 80
+      targetPort: 8080
+  selector:
+    app: web-app
